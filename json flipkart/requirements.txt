@@ -1,2 +1,0 @@
-aiogram
-curl_cffi
