@@ -46,6 +46,12 @@ GAMES = [
     {"id": "nazaria",    "name": "Nazar Pop",     "play_time": 45, "gems": 100},
 ]
 
+# ===================== RUN-NORMAL SETTINGS =====================
+FAST_PLAY_SECS = 18        # per-game wait in fast (normal) mode
+BATCH_SIZE = 2             # games played in parallel per batch
+STAGGER_DELAY = 1.0        # sec offset between the 2 parallel games (avoids simultaneous hits)
+RETRY_ROUNDS = 3           # how many times to retry a failed game at the end
+
 # ===================== SESSION & REFERRAL FILES =====================
 SESSION_DIR = Path("sessions")
 SESSION_DIR.mkdir(exist_ok=True)
@@ -463,7 +469,7 @@ class ShopsyBotClient:
         user = self.get_user()
         if self._game_already_done(game_id, user):
             return None, "already_done"
-        secs = game["play_time"] if not fast else (game["play_time"] if game["play_time"] >= 60 else 15)
+        secs = game["play_time"] if not fast else FAST_PLAY_SECS
         start = self._post("/1/shopsy/games", {
             "requestMethod": "POST",
             "routeUri": "game/game-started",
@@ -491,20 +497,68 @@ class ShopsyBotClient:
 
     async def run_normal_async(self, msg: types.Message):
         status_msg = await msg.answer("⏳ Normal mode starting...")
+        loop = asyncio.get_event_loop()
         total = 0
-        for i, game in enumerate(GAMES, 1):
-            await status_msg.edit_text(f"⏳ Playing {game['name']} ({i}/{len(GAMES)})...")
-            loop = asyncio.get_event_loop()
-            result, status = await loop.run_in_executor(None, self.play_game, game, True)
-            if status == "success":
-                total += result
-                await status_msg.edit_text(f"✅ {game['name']} +{result} coins | Total: {total}")
-            elif status == "already_done":
-                await status_msg.edit_text(f"⏭️ {game['name']} already done | Total: {total}")
-            else:
-                await status_msg.edit_text(f"❌ {game['name']} failed | Total: {total}")
+        total_batches = (len(GAMES) + BATCH_SIZE - 1) // BATCH_SIZE
+        failed = []
+
+        def staggered_play(idx_game):
+            idx, game = idx_game
+            if idx > 0:
+                time.sleep(STAGGER_DELAY)   # offset 2nd game so requests don't clash
+            try:
+                return self.play_game(game, True)
+            except Exception:
+                return None, "error"
+
+        # Phase 1: parallel batches (staggered, 2 games at a time)
+        for bi in range(0, len(GAMES), BATCH_SIZE):
+            batch = GAMES[bi:bi + BATCH_SIZE]
+            bnum = bi // BATCH_SIZE + 1
+            names = " + ".join(g["name"] for g in batch)
+            await status_msg.edit_text(f"⏳ Batch {bnum}/{total_batches}: {names} (2 parallel)...")
+            with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                results = await loop.run_in_executor(
+                    None, lambda b=batch: list(ex.map(staggered_play, enumerate(b)))
+                )
+            for game, (result, status) in zip(batch, results):
+                if status == "success":
+                    total += result
+                    await status_msg.edit_text(f"🎯 {game['name']}: ✅ +{result} | Total: {total}")
+                elif status == "already_done":
+                    await status_msg.edit_text(f"🎯 {game['name']}: ⏭️ done | Total: {total}")
+                else:
+                    failed.append(game)
+                    await status_msg.edit_text(f"🎯 {game['name']}: ❌ fail (will retry) | Total: {total}")
+
+        # Phase 2: auto-retry failed games one-by-one at the end (sequential = safer)
+        round_num = 0
+        while failed and round_num < RETRY_ROUNDS:
+            round_num += 1
             await asyncio.sleep(1)
-        await status_msg.edit_text(f"✅ Normal run finished! +{total} coins total")
+            await status_msg.edit_text(f"🔄 Retrying {len(failed)} failed game(s) — round {round_num}/{RETRY_ROUNDS}...")
+            still_failed = []
+            for game in failed:
+                await status_msg.edit_text(f"🔄 Retrying {game['name']} (round {round_num})...")
+                try:
+                    result, status = await loop.run_in_executor(None, self.play_game, game, True)
+                except Exception:
+                    result, status = None, "error"
+                if status == "success":
+                    total += result
+                    await status_msg.edit_text(f"✅ {game['name']} recovered! +{result} | Total: {total}")
+                elif status == "already_done":
+                    await status_msg.edit_text(f"⏭️ {game['name']} already done | Total: {total}")
+                else:
+                    still_failed.append(game)
+                    await status_msg.edit_text(f"❌ {game['name']} still failing (round {round_num}) | Total: {total}")
+            failed = still_failed
+
+        if failed:
+            names = ", ".join(g["name"] for g in failed)
+            await status_msg.edit_text(f"⚠️ Done! +{total} coins. Couldn't complete: {names}")
+        else:
+            await status_msg.edit_text(f"✅ Normal run finished! All games done, +{total} coins (~54s)")
         return total
 
     async def run_exploit_async(self, msg: types.Message, parallel=50, burst_delay=7, rounds=2, start_delay=0.2):
@@ -588,7 +642,7 @@ def has_access(user_id:int)->bool:
 # ===================== KEYBOARDS =====================
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🚀 Login"), KeyboardButton(text="📥 JSON Login")],
+        [KeyboardButton(text="📥 JSON Login")],
         [KeyboardButton(text="💰 Balance"), KeyboardButton(text="👥 Referrals")],
         [KeyboardButton(text="ℹ️ Help")]
     ],
@@ -609,8 +663,6 @@ logged_kb = ReplyKeyboardMarkup(
 router = Router()
 
 class LoginState(StatesGroup):
-    waiting_phone = State()
-    waiting_otp = State()
     waiting_json = State()
 
 def get_client(user_id: int) -> ShopsyBotClient:
@@ -651,52 +703,6 @@ async def show_referrals(msg: types.Message, **kwargs):
         f"Share this with friends. When they start the bot, you get +1 referral."
     )
     await msg.answer(text, parse_mode="HTML")
-
-# ---- OTP Login ----
-@router.message(F.text == "🚀 Login")
-
-
-async def start_login(msg: types.Message, state: FSMContext, **kwargs):
-    await msg.answer("📱 10-digit mobile number bhejo:", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(LoginState.waiting_phone)
-
-@router.message(LoginState.waiting_phone)
-
-
-async def process_phone(msg: types.Message, state: FSMContext, **kwargs):
-    phone = msg.text.strip()
-    if not phone.isdigit() or len(phone) != 10:
-        await msg.answer("❌ Galat number. Sahi 10‑digit daalo.")
-        return
-    await state.update_data(phone=phone)
-    client = get_client(msg.from_user.id)
-    try:
-        client.bootstrap()
-        client.send_otp(phone)
-        await state.update_data(client_state=client)
-        await msg.answer(f"📬 OTP bhej diya +91{phone}.\nOTP enter karo:")
-        await state.set_state(LoginState.waiting_otp)
-    except Exception as e:
-        await msg.answer(f"❌ Error: {e}")
-        await state.clear()
-
-@router.message(LoginState.waiting_otp)
-
-
-async def process_otp(msg: types.Message, state: FSMContext, **kwargs):
-    data = await state.get_data()
-    client = data.get("client_state")
-    if not client:
-        await msg.answer("⚠️ Session expired. Login again.")
-        await state.clear()
-        return
-    otp = msg.text.strip()
-    try:
-        client.verify_otp(data["phone"], otp)
-        await msg.answer("✅ Login successful!", reply_markup=logged_kb)
-        await state.clear()
-    except Exception as e:
-        await msg.answer(f"❌ {e}")
 
 # ---- JSON Login (bootstrap before verify) ----
 @router.message(F.text == "📥 JSON Login")
@@ -817,9 +823,8 @@ async def exploit(msg: types.Message, **kwargs):
 async def help_cmd(msg: types.Message, **kwargs):
     await msg.answer(
         "🛒 <b>Shopsy Ultimate Bot</b>\n\n"
-        "🚀 Login – OTP login\n"
         "📥 JSON Login – Import existing session (verified)\n"
-        "⚡ Run Normal – Play games normally\n"
+        "⚡ Run Normal – Play 6 games (2 parallel + stagger) + auto-retry failed (~54s)\n"
         "🔥 Exploit – Parallel exploit (50 sessions, burst 7s, 2 rounds)\n"
         "💰 Balance – Check coins\n"
         "👥 Referrals – Your referral count & link\n"
